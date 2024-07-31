@@ -1,0 +1,389 @@
+---
+title: "humanDD_sesame_1129"
+output:
+  html_document: default
+  pdf_document: default
+date: "2023-11-02"
+---
+
+This report evaluates differences in pain causing intervertebral discs and non pain causing disc in a single subject. All discs are degenerating. Samples were run on the Illumina MethylationEPIC v2.0 Beadchip. The single subject is subset of a larger data set
+
+# LIBRARIES
+```{r, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+
+# load the necessary libraries
+library(tidyverse)
+library(sesame)
+library(readxl) # to read in excel data - sample annotation sheet
+library(SummarizedExperiment)
+library(ggrepel) # for putting labels on plots
+library(methylGSA) #pathway analysis
+library(ggpubr) #combine plots
+library(data.table) # to use %like%
+library(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
+
+#After a new installation, one must cache the associated annotation data using the following command. This needs to be done only once per SeSAMe installation/update. Caching data to local guarantees proper data retrieval and saves internet traffic.
+sesameDataCache()
+```
+
+
+# FUNCTIONS
+```{r}
+# FUNCTION - plot differences in beta values given a list of the beta values and list of CpG sites of interest
+beta_map<-function(merged_list,betas_1129, title){
+  betas<-merge(merged_list, betas_1129, by="IlmnID")%>%
+    arrange(Pval_DiscographyPain)
+betas$Gene_names <- sub(";.*", "", betas$UCSC_RefGene_Name)
+betas$Gene_names2 <- sub(";.*", "", betas$GencodeV41_Name)
+betas<-betas%>% mutate(mycolor=ifelse(diff>0,"Painful More Methylated", "Non-Painful More Methylated"))
+
+#make factor for plotting
+betas$Gene_names<-factor(betas$Gene_names,levels=unique(betas$Gene_names))
+betas$ID<-paste(betas$Gene_names,"/", betas$Gene_names2)
+betas$ID<-factor(betas$ID,levels=unique(betas$ID))
+
+ggplot(betas, aes(ID, diff, fill=mycolor))+
+  geom_col()+
+  theme_minimal()+
+  theme(axis.text.x = element_text(angle = 90, vjust = 1, hjust=1, size = 14),
+        axis.text.y = element_text(size = 14),
+        axis.title.x = element_text(size = 18),
+        axis.title.y = element_text(size = 18),
+        legend.text = element_text(size = 14),
+        legend.title = element_text(size = 18),
+        plot.title = element_text(hjust = 0.5, size = 22))+
+  scale_fill_manual("More Methylated",values = c("#00AFBB", "#bb0c00"), 
+                     labels = c("Non-Painful","Painful"))+
+  xlab("Gene Associated with CpG Site")+ylab("Difference in Beta\n(Painful - Non-Painful)")+ggtitle(title)
+}
+
+
+
+#FUNCTION - volcano plot
+volcano<-function(merged_list, betas_1129){
+  betas<-merge(merged_list, betas_1129, by="IlmnID")
+  betas$Gene_names <- sub(";.*", "", betas$UCSC_RefGene_Name)
+
+temp<-betas%>%
+  subset(Eff_Discography>0.05)%>%
+  slice_min(Pval_DiscographyPain, n=20)
+betas$delabel<-ifelse(betas$IlmnID %in% temp$IlmnID, betas$Gene_names, NA)
+
+
+betas$volcanoID<-ifelse(betas$Pval_DiscographyPain<0.05,
+                        ifelse(betas$diff>.05,
+                               "UP",ifelse(betas$diff<(-.05),"DOWN","NO"))
+                        ,"NO")
+
+ ggplot(data = subset(betas, !is.na(diff)), aes(x = diff, y = -log10(Pval_DiscographyPain), col=volcanoID,label=delabel)) +
+  geom_vline(xintercept = c(-.05, .05), col = "gray", linetype = 'dashed') +
+  geom_hline(yintercept = -log10(0.05), col = "gray", linetype = 'dashed') +
+  geom_point(size = 1) +
+  scale_color_manual("More Methylated",values = c("#00AFBB", "grey", "#bb0c00"), # to set the colours of our variable<br />
+                     labels = c("Non-Painful", "Not significant", "Painful")) + # to set the labels in case we want to overwrite the categories from the dataframe (UP, DOWN, NO)<br />
+  coord_cartesian(ylim = c(0, 5), xlim = c(-0.6,0.6)) + # since some genes can have minuslog10padj of inf, we set these limits<br />
+  labs(x = "Difference in Beta\n(Painful - Non-Painful)", y = expression("-log"[10]*"p-value")) +
+  scale_x_continuous(breaks = seq(-0.6, 0.6, 0.2))+ # to customise the breaks in the x axis
+   geom_label_repel(color="black",max.overlaps =Inf, box.padding = 1)+
+   theme_minimal()+
+   theme(axis.text.x = element_text(angle = 90, vjust = 1, hjust=1, size = 14),
+        axis.text.y = element_text(size = 14),
+        axis.title.x = element_text(size = 18),
+        axis.title.y = element_text(size = 18),
+        legend.text = element_text(size = 14),
+        legend.title = element_text(size = 18),
+        plot.title = element_text(hjust = 0.5, size = 22))+
+   scale_x_continuous(labels = function(x) sprintf("%g", x)) +
+   ggtitle ("Differentially Methylated CpG Sites (Promoters)")
+   }
+```
+
+# Check SeSAMe and R versions 
+If code encounters issues, check the [SeSAMe website](https://www.bioconductor.org/packages/devel/bioc/vignettes/sesame/inst/doc/sesame.html) for current usage/updates
+```{r}
+sesame_checkVersion()
+```
+
+# Load Files
+```{r}
+# IDATs contain the experiment data:
+idat_dir = "/Users/yeate008/Documents/humanDD/Stone4_Project_007/idat/"
+#sample_annotation contains information about experiment groups, sampleIDs, etc.
+sample_annotation <- read_excel("/Users/yeate008/Documents/humanDD/SeSAMe/sample_annotation.xlsx")
+
+#EPICv2 ordering address file - not natively supported by SeSAMe yet, so it must be loaded from external source
+addr = sesameAnno_buildAddressFile("https://github.com/zhou-lab/InfiniumAnnotationV1/raw/main/EPICv2/hg38.tsv.gz") 
+
+#EPICv2 manifest file 
+EPIC <- read_csv("MethylationEPIC v2.0 Files/EPIC-8v2-0_A1.csv",skip = 7) #manifest file
+
+```
+
+```{r}
+#Subject IDs list - specific to experiment
+
+new_names<-c("1023 3/4",
+"1023 4/5",
+"1023 5/1",
+"1024 3/4",
+"1129 4/5",
+"1024 4/5",
+"1024 5/1",
+"1106 4/5",
+"1129 3/4",
+"1129 5/1",
+"2000 3/4",
+"TQ47",
+"TQ56",
+"TQ63",
+"TQ8",
+"2000 4/5")
+```
+
+# Preprocessing
+The [recommended prep code](https://zhou-lab.github.io/sesame/dev/sesame.html) for EPICv2 is the default and includes:
+*Mask probes of poor design
+*Infer channel for Infinium I probes
+*Non-linear dye bias correction
+*Detection of p-value masking using oob (pOOBAH)
+*Background subtraction using oob (noob)
+```{r}
+#calculate beta values
+betas_all = openSesame(idat_dir, manifest = addr) #getBetas is the default
+
+#subset the betas DF to include only those associated with subject 1129 
+betas_1129=as.data.frame(betas_all[,c(5, 9:10)]) %>%
+  tibble::rownames_to_column("IlmnID") #convert row names to be column 1 (IlmID)
+
+# return SigDF list (for all subjects) - rename IDs with Subjects
+sdfs = openSesame(idat_dir, func = NULL, manifest = addr) 
+names(sdfs)<-new_names
+```
+
+# Quality Control
+Before moving on to analysis, we want to do some quality control checks. 
+
+## Detection success of all samples
+```{r}
+qcs_detect = openSesame(sdfs, prep="", func = sesameQC_calcStats, funs="detection")
+sesameQC_plotBar(qcs_detect)
+```
+
+## SNP Heat map
+This will allow us to check for sample mix-ups (check that subjects group together)
+```{r}
+#SNP heatmap 
+sesameQC_plotHeatSNPs(sdfs)
+```
+
+## Other QC stats (just for Subject 1129)
+### level 3/4
+```{r}
+qcs_all = openSesame(sdfs, prep="", func = sesameQC_calcStats)
+qcs_all[['1129 3/4']]
+```
+### level 4/5
+```{r}
+qcs_all[['1129 4/5']]
+```
+### level 5/1
+```{r}
+qcs_all[['1129 5/1']]
+```
+
+# Inferences
+SeSAMe does have functionality to infer things like sex, ethnicity, and age but it appears that functionality is not yet implemented with the EPICv2 array 
+
+# Differential Methylation
+For differential methylation, the following steps were performed:
+1. Combine the calculated beta values with the sample_annotation file into a SummarizedExperiment object
+2. Subset this object to include only subject 1129 data
+3. Perform differential methylation analysis on only non-NA values
+    +the two groups for differential methylation were painful (n=2) vs non-painful (n=1) discs
+```{r}
+#Create the Summarized Experiment objects
+se_humanDD=SummarizedExperiment(assays=betas_all, colData = sample_annotation) 
+se_1129=se_humanDD[, se_humanDD$Subject=="1129"] #subset to include only subject 1129
+
+#check for NA values for the coefficients that will go into model
+se_1129_ok=(checkLevels(assay(se_1129), colData(se_1129)$Discography))
+se_1129_ok= se_1129[se_1129_ok,]
+
+#Differential methylation
+test_DML_1129 =  DML(se_1129_ok,~Discography) #differential methylation model
+test_result_1129 = summaryExtractTest(test_DML_1129) #test
+```
+# Top CpG Sites
+
+## Effect Size >5%
+```{r}
+#sort the differential methylation dataset for only those sites with an effect size >5%
+DML_effect05<-test_result_1129 %>% dplyr::filter(Eff_Discography>0.05) %>%
+  dplyr::select(Probe_ID, Pval_DiscographyPain, Eff_Discography)%>% # select just the columns we need
+  arrange(Pval_DiscographyPain) %>% # order by p-value 
+  dplyr::rename(IlmnID=Probe_ID) #rename column so it can be merged with the manifest file
+
+#get cg information from manifest file
+temp<-EPIC[(EPIC$IlmnID %in% DML_effect05$IlmnID),] #look for the cgs in DML_effect05
+merged_1129_effect05<- merge(temp, DML_effect05, by="IlmnID") #merge the manifest info with the DML info
+
+#Also have the full list with their p-values
+DML_all<-test_result_1129 %>% 
+  dplyr::select(Probe_ID, Pval_DiscographyPain, Eff_Discography)%>%
+  arrange(Pval_DiscographyPain) %>% 
+  dplyr::rename(IlmnID=Probe_ID) #rename so it can be merged with the manifest file
+
+temp<-EPIC[(EPIC$IlmnID %in% DML_all$IlmnID),]
+merged_1129_all<- merge(temp, DML_all, by="IlmnID")
+
+```
+
+## Top 50 CpG sites (all - effect size >5%)
+Here, p-values were used for ranking candidate CpG sites only - not used for statistical comparison. Importantly, this is only plotting the top 50 sites with gene names associated with the CpG site.
+```{r}
+#create merged list containing only top 50 p-values
+merged_1129_top50<-merged_1129_effect05%>%
+  slice_min(Pval_DiscographyPain, n=50)%>%
+  arrange(Pval_DiscographyPain)
+
+#add column to the betas_1129 df to calculate the difference between painful and non-painful discs
+betas_1129$painful<-rowMeans(betas_1129[,c(2,3)])
+betas_1129$diff<-apply(betas_1129[,c('painful', '207042800122_R02C01')], 1, function(x) { (x[1]-x[2]) } )
+
+#plot
+beta_map(merged_1129_top50, betas_1129, "Differentially Methylated CpG Sites (All Sites)")
+```
+
+## Top 50 CpG site (promoters (self annotation) - p<0.05 & Eff>5%)
+https://www.ncbi.nlm.nih.gov/pmc/articles/PMC9665128/
+" CpGs associated with ‘TSS 1500,’ ‘TSS 200,’ ‘1st Exon’ and ‘5’ UTR’ locations were categorized as ‘Promoter’ CpGs"
+```{r}
+#create merged list containing only top 50 p-values
+merged_1129_effect05$UCSC_RefGene_Group <- sub(";.*", "", merged_1129_effect05$UCSC_RefGene_Group)
+merged_1129_effect05$GencodeV41_Group <- sub(";.*", "", merged_1129_effect05$GencodeV41_Group)
+
+merged_1129_top50_promoters<-merged_1129_effect05%>% 
+  subset(UCSC_RefGene_Group == "TSS1500"|
+           UCSC_RefGene_Group == "TSS200"|
+           UCSC_RefGene_Group == "exon_1"|
+           UCSC_RefGene_Group == "5UTR"|
+           GencodeV41_Group == "TSS1500"|
+           GencodeV41_Group  == "TSS200"|
+           GencodeV41_Group == "exon_1"|
+           GencodeV41_Group == "5UTR")%>%
+  slice_min(Pval_DiscographyPain, n=50)%>%
+  arrange(Pval_DiscographyPain)
+
+#plot
+beta_map(merged_1129_top50_promoters, betas_1129, "Differentially Methylated CpG Sites (Promoters)")
+```
+
+
+## Volcano plots
+```{r}
+# promoters only
+merged_1129_all$UCSC_RefGene_Group <- sub(";.*", "", merged_1129_all$UCSC_RefGene_Group)
+merged_1129_all$GencodeV41_Group <- sub(";.*", "", merged_1129_all$GencodeV41_Group)
+
+merged_1129_promoters<- merged_1129_all%>% 
+  subset(UCSC_RefGene_Group == "TSS1500"|
+           UCSC_RefGene_Group == "TSS200"|
+           UCSC_RefGene_Group == "exon_1"|
+           UCSC_RefGene_Group == "5UTR"|
+           GencodeV41_Group == "TSS1500"|
+           GencodeV41_Group  == "TSS200"|
+           GencodeV41_Group == "exon_1"|
+           GencodeV41_Group == "5UTR")
+
+volcano(merged_1129_promoters, betas_1129)
+
+```
+
+# methylGSA
+
+```{r}
+cpg_all<-dplyr::select(merged_1129_all, Name, Pval_DiscographyPain)%>%na.omit()
+cpg_all <- setNames(cpg_all$Pval_DiscographyPain, as.character(cpg_all$Name))
+
+############# methylglm ########################
+
+#Promoters only ("promoter2" selects the same as the self annotation above)
+GO_promoter = methylglm(cpg_all, array.type = "EPIC", group="promoter2")
+KEGG_promoter = methylglm(cpg_all, array.type = "EPIC", GS.type = "KEGG", group="promoter2")
+Reactome_promoter = methylglm(cpg_all, array.type = "EPIC", GS.type = "Reactome", group="promoter2")
+
+
+############# methylrra - ORA ########################
+
+#methylrra - correcting for multiple p-values in each gene
+GO_promoter_ORA = methylRRA(cpg_all, array.type = "EPIC", group="promoter2", method = "ORA")
+KEGG_promoter_ORA = methylRRA(cpg_all, array.type = "EPIC", GS.type = "KEGG", group="promoter2", method = "ORA")
+Reactome_promoter_ORA = methylRRA(cpg_all, array.type = "EPIC", GS.type = "Reactome", group="promoter2", method = "ORA")
+
+# ALL P-VALUES SAME
+
+############# methylrra - GSEA ####################
+
+GO_promoter_GSEA = methylRRA(cpg_all, array.type = "EPIC", group="promoter2", method = "GSEA")
+KEGG_promoter_GSEA = methylRRA(cpg_all, array.type = "EPIC", GS.type = "KEGG", group="promoter2", method = "GSEA")
+Reactome_promoter_GSEA = methylRRA(cpg_all, array.type = "EPIC", GS.type = "Reactome", group="promoter2", method = "GSEA")
+
+
+```
+
+# For USASP Poster
+## Self Annotated Top CpGs
+```{r}
+Top50_self <- read_excel("~/Users/yeate008/Documents/humanDD/Manuscript_1129/Tables_03252024.xlsx", 
+    sheet = "Top50_promoter", range = "B1:O51")
+betas_1129$Name<-substr(betas_1129$IlmnID,1,10)
+
+betas<-merge(Top50_self, betas_1129, by="Name")%>%
+  slice_min(Pval_DiscographyPain, n=40)%>%
+    arrange(Pval_DiscographyPain)
+betas<-betas%>% mutate(mycolor=ifelse(diff>0,"Painful More Methylated", "Non-Painful More Methylated"))
+
+#make factor for plotting
+betas$Gene_SelfAnno<-factor(betas$Gene_SelfAnno,levels=unique(betas$Gene_SelfAnno))
+
+
+ggplot(betas, aes(Gene_SelfAnno, diff, fill=mycolor))+
+  geom_col()+
+  theme_minimal()+
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1, size = 12),
+        axis.text.y = element_text(size = 14),
+        axis.title.x = element_text(size = 14),
+        axis.title.y = element_text(size = 18),
+        legend.text = element_text(size = 14),
+        legend.title = element_text(size = 18),
+        plot.title = element_text(hjust = 0.5, size = 22))+
+  scale_fill_manual("More Methylated",values = c("#ffcc33", "#7a0019"), 
+                     labels = c("Non-Painful","Painful"))+
+  xlab("Gene Associated with CpG Site")+ylab("Difference in Beta\n(Painful - Non-Painful)")+ggtitle("Differentially Methylated CpG Sites (Promoters)")
+
+```
+
+## Significant Pathways
+```{r}
+paths <- read_excel("Documents/humanDD/Manuscript_1129/Tables_03252024.xlsx", 
+     sheet = "Pathways_Significant")
+
+
+paths$Description<-factor(paths$Description, levels=unique(paths$Description)) 
+ggplot(paths, aes(x=Size, Description, fill = Method))+
+  geom_col()+
+  #scale_size("Adjusted P-Value",trans = 'reverse',range = c(3, 7), breaks = c(0.01,0.05))+
+  theme_minimal()+
+    theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1, size = 16),
+        axis.text.y = element_text(size = 14),
+        axis.title.x = element_text(size = 16),
+        axis.title.y = element_blank(),
+        legend.text = element_text(size = 12),
+        legend.title = element_blank(),
+        plot.title = element_text(hjust = 0.5, size = 22),
+        legend.position = "bottom")+
+  scale_fill_manual("Method",values = c("black","#7a0019","#ffcc33"))+
+  xlab("Size")
+
+```
